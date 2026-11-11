@@ -540,8 +540,8 @@ private fun recognizeShape(points: List<Offset>, enabled: Boolean): List<Offset>
         val incoming = atan2(current.y - previous.y, current.x - previous.x)
         val outgoing = atan2(next.y - current.y, next.x - current.x)
         var turn = abs(outgoing - incoming)
-        if (turn > PI) turn = 2.0 * PI - turn
-        if (turn > 0.65) current else null
+        if (turn > PI.toFloat()) turn = 2f * PI.toFloat() - turn
+        if (turn > 0.65f) current else null
     }.fold(mutableListOf<Offset>()) { result, point ->
         if (result.isEmpty() || (point - result.last()).getDistance() > diagonal * 0.12f) result.add(point)
         result

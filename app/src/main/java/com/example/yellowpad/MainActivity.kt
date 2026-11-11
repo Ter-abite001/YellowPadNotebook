@@ -362,10 +362,7 @@ private fun NotebookApp() {
                             if (stroke.points.size == 1) {
                                 drawCircle(stroke.color, stroke.width / 2f, stroke.points.first())
                             } else if (stroke.points.size > 1) {
-                                val path = Path().apply {
-                                    moveTo(stroke.points.first().x, stroke.points.first().y)
-                                    stroke.points.drop(1).forEach { lineTo(it.x, it.y) }
-                                }
+                                val path = smoothedStrokePath(stroke.points)
                                 drawPath(path, stroke.color, style = Stroke(stroke.width, cap = StrokeCap.Round))
                             }
                         }
@@ -498,66 +495,254 @@ private fun averageDistance(points: List<Offset>, center: Offset): Float {
     return points.sumOf { (it - center).getDistance().toDouble() }.toFloat() / points.size
 }
 
+private fun smoothedStrokePath(points: List<Offset>): Path = Path().apply {
+    if (points.isEmpty()) return@apply
+    moveTo(points.first().x, points.first().y)
+    if (points.size == 2) {
+        lineTo(points.last().x, points.last().y)
+        return@apply
+    }
+    for (index in 0 until points.lastIndex) {
+        val previous = points[(index - 1).coerceAtLeast(0)]
+        val start = points[index]
+        val end = points[index + 1]
+        val next = points[(index + 2).coerceAtMost(points.lastIndex)]
+        val control1 = start + (end - previous) / 6f
+        val control2 = end - (next - start) / 6f
+        cubicTo(control1.x, control1.y, control2.x, control2.y, end.x, end.y)
+    }
+    lineTo(points.last().x, points.last().y)
+}
+
 private fun recognizeShape(points: List<Offset>, enabled: Boolean): List<Offset> {
-    if (!enabled || points.size < 5) return points
-    val first = points.first()
-    val last = points.last()
+    if (!enabled || points.size < 2) return points
+
     val boundsLeft = points.minOf { it.x }
     val boundsRight = points.maxOf { it.x }
     val boundsTop = points.minOf { it.y }
     val boundsBottom = points.maxOf { it.y }
-    val width = boundsRight - boundsLeft
-    val height = boundsBottom - boundsTop
-    val diagonal = sqrt(width * width + height * height)
-    if (diagonal < 36f) return points
-
-    val pathLength = points.zipWithNext().sumOf { (a, b) -> (b - a).getDistance().toDouble() }.toFloat()
-    val directLength = (last - first).getDistance()
-    if (directLength > 36f && pathLength > 0f && directLength / pathLength > 0.95f) return listOf(first, last)
-
-    if ((first - last).getDistance() > max(18f, diagonal * 0.18f) || width < 18f || height < 18f) return points
-
     val center = Offset((boundsLeft + boundsRight) / 2f, (boundsTop + boundsBottom) / 2f)
-    val aspect = width / height
-    val radii = points.map { (it - center).getDistance() }
-    val meanRadius = radii.average().toFloat()
-    val radialError = radii.map { abs(it - meanRadius) }.average().toFloat() / meanRadius.coerceAtLeast(1f)
-    if (aspect in 0.72f..1.38f && radialError < 0.2f) {
-        return (0..48).map { index ->
-            val angle = 2f * PI.toFloat() * index / 48f
-            Offset(center.x + width / 2f * cos(angle), center.y + height / 2f * sin(angle))
-        }
+    val scale = sqrt((boundsRight - boundsLeft) * (boundsRight - boundsLeft) +
+        (boundsBottom - boundsTop) * (boundsBottom - boundsTop))
+    if (scale < 36f) return points
+
+    val normalized = points.map { Offset((it.x - center.x) / scale, (it.y - center.y) / scale) }
+    val first = normalized.first()
+    val last = normalized.last()
+    val directLength = (last - first).getDistance()
+    val pathLength = normalized.zipWithNext().sumOf { (a, b) -> (b - a).getDistance().toDouble() }.toFloat()
+
+    if (pathLength > 0f && directLength / pathLength > 0.985f) {
+        val maxDeviation = normalized.maxOf { distanceFromLine(it, first, last) }
+        if (maxDeviation < 0.025f) return listOf(points.first(), points.last())
     }
 
-    val corners = points.indices.mapNotNull { index ->
-        val previous = points[(index - 1 + points.size) % points.size]
+    val closed = (first - last).getDistance() < 0.12f
+    if (!closed && points.size >= 8) {
+        recognizeArrow(normalized, center, scale)?.let { return it }
+    }
+    if (!closed || normalized.size < 8) return points
+
+    val ring = normalized.dropLast(1).ifEmpty { normalized }
+    val sampled = resampleStroke(ring + ring.first(), 96).dropLast(1)
+    val corners = findCorners(sampled, closed = true)
+
+    if (corners.size < 3) {
+        val left = normalized.minOf { it.x }
+        val right = normalized.maxOf { it.x }
+        val top = normalized.minOf { it.y }
+        val bottom = normalized.maxOf { it.y }
+        val radiusX = (right - left) / 2f
+        val radiusY = (bottom - top) / 2f
+        if (radiusX <= 0f || radiusY <= 0f || radiusY / radiusX !in 0.15f..6.7f) return points
+        val ellipseCenter = Offset((left + right) / 2f, (top + bottom) / 2f)
+        val ellipseErrors = sampled.map { point ->
+            abs(sqrt(
+                ((point.x - ellipseCenter.x) / radiusX) * ((point.x - ellipseCenter.x) / radiusX) +
+                    ((point.y - ellipseCenter.y) / radiusY) * ((point.y - ellipseCenter.y) / radiusY)
+            ) - 1f)
+        }
+        val angularCoverage = sampled.map {
+            atan2((it.y - ellipseCenter.y) / radiusY, (it.x - ellipseCenter.x) / radiusX)
+        }.sorted()
+        val largestAngularGap = (angularCoverage.zipWithNext().maxOfOrNull { it.second - it.first } ?: 0f)
+            .coerceAtLeast((angularCoverage.firstOrNull()?.let { angularCoverage.first() + 2f * PI.toFloat() - angularCoverage.last() } ?: 0f))
+        val ellipseConfidence = 1f - ellipseErrors.average().toFloat() / 0.18f
+        if (ellipseConfidence >= 0.72f && ellipseErrors.maxOrNull()!! < 0.36f && largestAngularGap < 1.2f) {
+            return (0..64).map { index ->
+                val angle = 2f * PI.toFloat() * index / 64f
+                Offset(
+                    center.x + (ellipseCenter.x + radiusX * cos(angle)) * scale,
+                    center.y + (ellipseCenter.y + radiusY * sin(angle)) * scale
+                )
+            }
+        }
+        return points
+    }
+
+    if (corners.size !in 3..4) return points
+    val ordered = corners.sortedBy { atan2(it.y, it.x) }
+    val polygonError = sampled.map { point ->
+        ordered.indices.minOf { index ->
+            distanceFromSegment(point, ordered[index], ordered[(index + 1) % ordered.size])
+        }
+    }
+    if (polygonError.average() > 0.035 || polygonError.maxOrNull()!! > 0.11) return points
+
+    val sideLengths = ordered.indices.map { index ->
+        (ordered[(index + 1) % ordered.size] - ordered[index]).getDistance()
+    }
+    if (sideLengths.minOrNull()!! < 0.12f) return points
+    if (corners.size == 3) {
+        val angles = interiorAngles(ordered)
+        val confidence = 1f - polygonError.average().toFloat() / 0.08f
+        if (angles.all { it in 0.38f..2.45f } && confidence >= 0.72f) {
+            return (ordered + ordered.first()).map { Offset(center.x + it.x * scale, center.y + it.y * scale) }
+        }
+        return points
+    }
+
+    val angleErrors = interiorAngles(ordered).map { abs(it - PI.toFloat() / 2f) }
+    if (angleErrors.any { it > 0.55f }) return points
+    val rightAngleError = angleErrors.average().toFloat()
+    val rightAngleConfidence = 1f - rightAngleError / 0.6f
+    val sideRatio = sideLengths.maxOrNull()!! / sideLengths.minOrNull()!!
+    val polygonConfidence = 1f - polygonError.average().toFloat() / 0.08f
+    if (rightAngleConfidence < 0.68f || polygonConfidence < 0.72f) return points
+    val square = sideRatio <= 1.15f
+    val recognizedVertices = if (square) {
+        val firstEdge = ordered[1] - ordered[0]
+        val secondEdge = ordered[3] - ordered[0]
+        val side = (sideLengths[0] + sideLengths[1] + sideLengths[2] + sideLengths[3]) / 4f
+        val firstUnit = firstEdge / firstEdge.getDistance()
+        val secondUnit = secondEdge / secondEdge.getDistance()
+        val orientation = if (firstUnit.x * secondUnit.y - firstUnit.y * secondUnit.x >= 0f) 1f else -1f
+        val perpendicularUnit = Offset(-firstUnit.y * orientation, firstUnit.x * orientation)
+        listOf(
+            ordered[0],
+            ordered[0] + firstUnit * side,
+            ordered[0] + firstUnit * side + perpendicularUnit * side,
+            ordered[0] + perpendicularUnit * side
+        )
+    } else {
+        ordered
+    }
+    return (recognizedVertices + recognizedVertices.first()).map {
+        Offset(center.x + it.x * scale, center.y + it.y * scale)
+    }
+}
+
+private fun resampleStroke(points: List<Offset>, count: Int): List<Offset> {
+    if (points.size < 2 || count < 2) return points
+    val lengths = points.zipWithNext().map { (a, b) -> (b - a).getDistance() }
+    val totalLength = lengths.sum()
+    if (totalLength <= 0f) return List(count) { points.first() }
+    val result = ArrayList<Offset>(count)
+    var segment = 0
+    var traversed = 0f
+    for (index in 0 until count) {
+        val target = totalLength * index / (count - 1)
+        while (segment < lengths.lastIndex && traversed + lengths[segment] < target) {
+            traversed += lengths[segment]
+            segment++
+        }
+        val length = lengths[segment]
+        val fraction = if (length == 0f) 0f else (target - traversed) / length
+        result.add(points[segment] + (points[segment + 1] - points[segment]) * fraction)
+    }
+    return result
+}
+
+private fun findCorners(points: List<Offset>, closed: Boolean): List<Offset> {
+    if (points.size < 8) return emptyList()
+    val window = max(3, points.size / 24)
+    val candidates = points.indices.mapNotNull { index ->
+        if (!closed && (index < window || index >= points.size - window)) return@mapNotNull null
+        val before = points[if (closed) (index - window + points.size) % points.size else index - window]
         val current = points[index]
-        val next = points[(index + 1) % points.size]
-        val incoming = atan2(current.y - previous.y, current.x - previous.x)
-        val outgoing = atan2(next.y - current.y, next.x - current.x)
-        var turn = abs(outgoing - incoming)
-        if (turn > PI.toFloat()) turn = 2f * PI.toFloat() - turn
-        if (turn > 0.65f) current else null
-    }.fold(mutableListOf<Offset>()) { result, point ->
-        if (result.isEmpty() || (point - result.last()).getDistance() > diagonal * 0.12f) result.add(point)
-        result
-    }
-    if (corners.size == 4 && corners.all { it.x in boundsLeft..boundsRight && it.y in boundsTop..boundsBottom }) {
-        val ordered = corners.sortedBy { atan2(it.y - center.y, it.x - center.x) }
-        val rightAngles = ordered.indices.map { index ->
-            val a = ordered[(index - 1 + ordered.size) % ordered.size] - ordered[index]
-            val b = ordered[(index + 1) % ordered.size] - ordered[index]
-            abs(a.x * b.x + a.y * b.y) / (a.getDistance() * b.getDistance()).coerceAtLeast(1f)
-        }
-        if (rightAngles.all { it < 0.42f }) {
-            return listOf(
-                Offset(boundsLeft, boundsTop), Offset(boundsRight, boundsTop),
-                Offset(boundsRight, boundsBottom), Offset(boundsLeft, boundsBottom), Offset(boundsLeft, boundsTop)
-            )
+        val after = points[if (closed) (index + window) % points.size else index + window]
+        val incoming = current - before
+        val outgoing = after - current
+        val turn = abs(atan2(
+            incoming.x * outgoing.y - incoming.y * outgoing.x,
+            incoming.x * outgoing.x + incoming.y * outgoing.y
+        ))
+        if (turn >= 0.58f) Corner(current, turn) else null
+    }.sortedByDescending { it.strength }
+
+    val selected = mutableListOf<Corner>()
+    for (candidate in candidates) {
+        if (selected.none { (it.point - candidate.point).getDistance() < 0.10f }) {
+            selected.add(candidate)
         }
     }
-    if (corners.size == 3) return corners + corners.first()
-    return points
+    return selected.map { it.point }
+}
+
+private data class Corner(val point: Offset, val strength: Float)
+
+private fun interiorAngles(vertices: List<Offset>): List<Float> = vertices.indices.map { index ->
+    val previous = vertices[(index - 1 + vertices.size) % vertices.size] - vertices[index]
+    val next = vertices[(index + 1) % vertices.size] - vertices[index]
+    atan2(
+        abs(previous.x * next.y - previous.y * next.x),
+        previous.x * next.x + previous.y * next.y
+    )
+}
+
+private fun distanceFromLine(point: Offset, start: Offset, end: Offset): Float =
+    distanceFromSegment(point, start, end)
+
+private fun distanceFromSegment(point: Offset, start: Offset, end: Offset): Float {
+    val segment = end - start
+    val lengthSquared = segment.x * segment.x + segment.y * segment.y
+    if (lengthSquared <= 0f) return (point - start).getDistance()
+    val projection = (((point.x - start.x) * segment.x + (point.y - start.y) * segment.y) / lengthSquared)
+        .coerceIn(0f, 1f)
+    return (point - (start + segment * projection)).getDistance()
+}
+
+private fun recognizeArrow(points: List<Offset>, center: Offset, scale: Float): List<Offset>? {
+    if (points.size < 20) return null
+    val sampled = resampleStroke(points, 100)
+    val start = sampled.first()
+    val end = sampled.last()
+    val bestTip = (12..72).flatMap { firstIndex ->
+        (firstIndex + 10..88).mapNotNull { secondIndex ->
+            val distance = (sampled[firstIndex] - sampled[secondIndex]).getDistance()
+            if (distance < 0.035f) Triple(firstIndex, secondIndex, distance) else null
+        }
+    }.minByOrNull { it.third } ?: return null
+    val (firstIndex, secondIndex) = bestTip
+    val tip = (sampled[firstIndex] + sampled[secondIndex]) / 2f
+    val firstWing = sampled.subList(firstIndex + 1, secondIndex)
+        .maxByOrNull { distanceFromSegment(it, start, tip) } ?: return null
+    val secondWing = end
+    val shaft = tip - start
+    val shaftLength = shaft.getDistance()
+    val shaftDeviation = sampled.take(firstIndex + 1).maxOf { distanceFromSegment(it, start, tip) }
+    val firstWingVector = firstWing - tip
+    val secondWingVector = secondWing - tip
+    if (shaftLength < 0.35f || shaftDeviation > 0.04f ||
+        firstWingVector.getDistance() !in 0.08f..0.5f ||
+        secondWingVector.getDistance() !in 0.08f..0.5f ||
+        max(firstWingVector.getDistance(), secondWingVector.getDistance()) /
+            min(firstWingVector.getDistance(), secondWingVector.getDistance()) > 2.5f
+    ) return null
+    val direction = shaft / shaftLength
+    val firstProjection = firstWingVector.x * direction.x + firstWingVector.y * direction.y
+    val secondProjection = secondWingVector.x * direction.x + secondWingVector.y * direction.y
+    if (firstProjection > -0.035f || secondProjection > -0.035f) return null
+    val firstAngle = atan2(abs(direction.x * firstWingVector.y - direction.y * firstWingVector.x),
+        -(direction.x * firstWingVector.x + direction.y * firstWingVector.y))
+    val secondAngle = atan2(abs(direction.x * secondWingVector.y - direction.y * secondWingVector.x),
+        -(direction.x * secondWingVector.x + direction.y * secondWingVector.y))
+    if (firstAngle !in 0.25f..1.35f || secondAngle !in 0.25f..1.35f) return null
+    val confidence = 1f - bestTip.third / 0.05f
+    if (confidence < 0.72f) return null
+    return listOf(start, tip, firstWing, tip, secondWing).map {
+        Offset(center.x + it.x * scale, center.y + it.y * scale)
+    }
 }
 
 private fun savePages(context: android.content.Context, pages: List<NotePage>) {

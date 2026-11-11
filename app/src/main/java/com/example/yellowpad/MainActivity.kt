@@ -16,7 +16,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Create
 import androidx.compose.material.icons.outlined.Delete
-import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Gesture
+import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Redo
 import androidx.compose.material.icons.outlined.Undo
@@ -33,6 +34,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -83,8 +85,8 @@ private data class PageSnapshot(val strokes: List<InkStroke>, val textAreas: Lis
 
 private data class NotePage(
     var title: String,
-    val strokes: MutableList<InkStroke> = mutableListOf(),
-    val textAreas: MutableList<TextArea> = mutableListOf(),
+    val strokes: SnapshotStateList<InkStroke> = mutableStateListOf(),
+    val textAreas: SnapshotStateList<TextArea> = mutableStateListOf(),
     val undoStack: MutableList<PageSnapshot> = mutableListOf(),
     val redoStack: MutableList<PageSnapshot> = mutableListOf()
 )
@@ -122,11 +124,12 @@ private fun NotebookApp() {
     var panY by remember { mutableFloatStateOf(0f) }
     var activePoints by remember { mutableStateOf<List<Offset>>(emptyList()) }
     var focusedTextId by remember { mutableStateOf<String?>(null) }
-    var refresh by remember { mutableIntStateOf(0) }
 
     fun page() = pages[current.coerceIn(0, pages.lastIndex)]
     fun save() = savePages(context, pages)
-    val contentRevision = refresh
+    val currentPage = page()
+    val visibleStrokes = currentPage.strokes.toList()
+    val textAreas = currentPage.textAreas.toList()
     fun resetPaperView() {
         zoom = 1f
         panX = 0f
@@ -143,7 +146,6 @@ private fun NotebookApp() {
                 recordUndo(page())
                 page().textAreas.add(it)
                 save()
-                refresh++
             }
             focusedTextId = target.id
         }
@@ -151,6 +153,7 @@ private fun NotebookApp() {
 
     LaunchedEffect(drawMode, current, focusedTextId) {
         if (!drawMode && focusedTextId != null) {
+            withFrameNanos { }
             focusRequester.requestFocus()
             keyboard?.show()
         }
@@ -172,7 +175,6 @@ private fun NotebookApp() {
                 if (target.undoStack.isNotEmpty()) {
                     target.redoStack.add(snapshot(target))
                     restore(target, target.undoStack.removeAt(target.undoStack.lastIndex))
-                    refresh++
                     save()
                 }
             }) { Icon(Icons.Outlined.Undo, "Undo", tint = Color.Black) }
@@ -181,7 +183,6 @@ private fun NotebookApp() {
                 if (target.redoStack.isNotEmpty()) {
                     target.undoStack.add(snapshot(target))
                     restore(target, target.redoStack.removeAt(target.redoStack.lastIndex))
-                    refresh++
                     save()
                 }
             }) { Icon(Icons.Outlined.Redo, "Redo", tint = Color.Black) }
@@ -231,7 +232,6 @@ private fun NotebookApp() {
                                 target.strokes.clear()
                                 target.textAreas.clear()
                                 focusedTextId = null
-                                refresh++
                                 save()
                             }
                             toolsExpanded = false
@@ -290,7 +290,6 @@ private fun NotebookApp() {
                                                 )
                                             )
                                             save()
-                                            refresh++
                                         }
                                         activePoints = emptyList()
                                     } else if (!drawMode && !hadMultiplePointers && !consumedByChild && maxMovement < viewConfiguration.touchSlop) {
@@ -308,7 +307,6 @@ private fun NotebookApp() {
                                         recordUndo(page())
                                         page().textAreas.add(textArea)
                                         focusedTextId = textArea.id
-                                        refresh++
                                         save()
                                     }
                                     break
@@ -326,7 +324,6 @@ private fun NotebookApp() {
                     }
             ) {
                 val viewportWidth = constraints.maxWidth.toFloat()
-                val textAreas = page().textAreas.toList()
                 LaunchedEffect(focusedTextId, maxHeight, zoom, drawMode) {
                     val focusedArea = textAreas.firstOrNull { it.id == focusedTextId }
                     if (!drawMode && focusedArea != null) {
@@ -356,12 +353,12 @@ private fun NotebookApp() {
                             drawLine(Color(0xFF303030), Offset(0f, y), Offset(size.width, y), 1.dp.toPx())
                             y += lineGap
                         }
-                        val visibleStrokes = page().strokes + listOfNotNull(
+                        val strokesToDraw = visibleStrokes + listOfNotNull(
                             activePoints.takeIf { it.isNotEmpty() }?.let {
                                 InkStroke(it, if (eraser) PaperColor else InkColor, if (eraser) 24f else penWidth * 2.2f, eraser)
                             }
                         )
-                        visibleStrokes.forEach { stroke ->
+                        strokesToDraw.forEach { stroke ->
                             if (stroke.points.size == 1) {
                                 drawCircle(stroke.color, stroke.width / 2f, stroke.points.first())
                             } else if (stroke.points.size > 1) {
@@ -387,7 +384,6 @@ private fun NotebookApp() {
                                     if (index >= 0 && target.textAreas[index].text != value) {
                                         recordUndo(target)
                                         target.textAreas[index] = target.textAreas[index].copy(text = value)
-                                        refresh++
                                         save()
                                     }
                                 },
@@ -415,7 +411,7 @@ private fun NotebookApp() {
         ) {
             ModeButton(
                 selected = drawMode,
-                icon = { Icon(Icons.Outlined.Create, "Draw") },
+                icon = { Icon(Icons.Outlined.Gesture, "Handwriting") },
                 onClick = {
                     drawMode = true
                     keyboard?.hide()
@@ -425,7 +421,7 @@ private fun NotebookApp() {
             Spacer(Modifier.width(22.dp))
             ModeButton(
                 selected = !drawMode,
-                icon = { Icon(Icons.Outlined.Edit, "Write") },
+                icon = { Icon(Icons.Outlined.Keyboard, "Typing") },
                 onClick = {
                     drawMode = false
                     if (page().textAreas.isNotEmpty()) focusedTextId = page().textAreas.first().id
